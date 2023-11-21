@@ -28,6 +28,173 @@ screentime_raw <- purrr::map_dfr(
 #   transform data                                                          ####
 
 #   ............................................................................
+#   functions                                                               ####
+
+#' Distribute seconds between hours
+#'
+#' Given a total number of seconds and the seconds in the first hour of
+#'   observations that span at least one hour mark, distributes the remaining
+#'   seconds among the different hours/rows.
+#'
+#' @param secs double. Total number of seconds.
+#' @param secs_1st double. Seconds in the first hour.
+#'
+#' @return double vector. Vector of seconds distributed over hours.
+distribute_secs_hourly <- function(secs, secs_1st) {
+  n_interm  <- floor((secs - secs_1st) / 3600)
+  secs_last <- secs - secs_1st - n_interm * 3600
+
+  c(
+    secs_1st,
+    rep(60, n_interm),
+    secs_last
+  )
+}
+
+#' Split oberservation
+#'
+#' Given a start time, end time, and total number of seconds, returns a tibble
+#'   with one row per hour and seconds distributed over the hours.
+#'
+#' @param time_start datetime. Start time of observation.
+#' @param time_end datetime. End time of observation.
+#' @param var_secs double. Seconds recorded for the observation
+#'
+#' @return tibble. A data frame with one row per hour.
+split_obs <- function(time_start, time_end, var_secs) {
+  time_end_1st <- ceiling_date({{ time_start }}, "hour")
+  time_end_oth <- seq(time_end_1st, floor_date({{ time_end }}, "hour"), "hour")
+
+  var_secs_1st <- interval(
+    {{ time_start }},
+    ceiling_date({{ time_start }}, "hour")
+  ) / seconds(1)
+
+  tibble(
+    start = c({{ time_start }}, time_end_oth),
+    end   = c(time_end_oth, {{ time_end }}),
+    secs  = distribute_secs_hourly({{ var_secs }}, var_secs_1st)
+  ) |>
+    # remove extra row for cases where end time is exactly at the hour mark
+    # also recompute app use end time as app use start time + seconds of use?
+    filter(
+      start != end
+    )
+}
+
+#' Split multi-hour observations
+#'
+#' Given a data frame with observations, splits those observations that span at
+#'   least one hour mark into as many rows as there are hours between start and
+#'   end datetime and distributes seconds appropriately to those hours.
+#'
+#'   Optionally, adds other variable(s) to the resulting data frame by
+#'   assigning their value only to the first row and setting the others to 0.
+#'
+#' @param data tibble. A data frame with one observation per row.
+#' @param time_start unquoted expression. Datetime column recording the start
+#'   of the observation.
+#' @param time_end unquoted expression. Datetime column recording the end of
+#'   the observation.
+#' @param var_secs unquoted expression. Column recording the seconds of the
+#'   observations.
+#' @param vars_oth character (vector). Additional column(s) to include
+#'   (Optional; default = `NULL`)
+#'
+#' @return tibble. Data frame with observations spanning the hour mark being
+#'   split into one observation per hour.
+split_multi_hour_obs <- function(data,
+                                 time_start,
+                                 time_end,
+                                 var_secs,
+                                 vars_oth = NULL) {
+  # add helper columns
+  data <- data |>
+    mutate(
+      start_hour_floor   = floor_date({{ time_start }}, unit = "hour"),
+      start_hour_ceiling = ceiling_date({{ time_start }}, unit = "hour"),
+      end_hour_floor     = floor_date({{ time_end }}, unit = "hour")
+    )
+
+  # observations that do not cross the hour mark -------------------------------
+
+  data_out_no_cross <- data |>
+    filter(
+      start_hour_floor   == end_hour_floor |
+      start_hour_ceiling == {{ time_end}}
+    )
+
+  # observations that cross the hour mark --------------------------------------
+
+  data_cross <- data |>
+    filter(
+      start_hour_floor   != end_hour_floor &
+      start_hour_ceiling != {{ time_end}}
+    )
+
+  data_out_cross <- data_cross |>
+    mutate(
+      data = purrr::pmap(
+        list({{ time_start }}, {{ time_end }}, {{ var_secs }}),
+        split_obs
+      )
+    ) |>
+    select(
+      -c(
+        {{ time_start }},
+        {{ time_end }},
+        {{ var_secs }}
+      ),
+    ) |>
+    tidyr::unnest(
+      data
+    ) |>
+    rename(
+      {{ time_start }} := start,
+      {{ time_end }}   := end,
+      {{ var_secs }}   := secs
+    )
+
+  # add value for selected other fields to the first row of observations that
+  # cross the hour mark and are split into several rows; all other rows set to 0
+  if (!is.null(vars_oth)) {
+    data_oth <- data_cross |>
+      select(
+        id_app,
+        id_participant,
+        {{ time_start }},
+        all_of(vars_oth)
+      )
+
+    data_out_cross <- data_out_cross |>
+      select(
+        -all_of(vars_oth)
+      ) |>
+      left_join(
+        data_oth,
+        by = join_by(id_participant, id_app, {{ time_start }})
+      ) |>
+      mutate(
+        across(
+          all_of(vars_oth),
+          ~ tidyr::replace_na(.x, 0)
+        )
+      )
+  }
+
+  # combine --------------------------------------------------------------------
+
+  bind_rows(
+    data_out_no_cross,
+    data_out_cross
+  ) |>
+    select(
+      -matches("_floor$|_ceiling$")
+    )
+}
+
+
+#   ............................................................................
 #   keyboard: seconds of use / number of keystrokes                         ####
 
 # KSANA recommended to remove the following app IDs
@@ -65,7 +232,6 @@ keyboard <- keyboard_raw |>
     )
   )
 
-
 # split multi-hour observations -----------------------------------------------
 
 # Note:
@@ -77,49 +243,17 @@ keyboard <- keyboard_raw |>
 # instances that start and end in different hours. We will, imperfectly, assume
 # that keystrokes were recorded in the same hour that the keyboard use began.
 
-# rows with observations that do not cross hours
-keyboard_unchanged <- keyboard |>
-  filter(
-    hour(tm_session_start) == hour(tm_session_end)
-  ) |>
-  mutate(
-    amt_keyboard_session_sec = lubridate::as.duration(amt_keyboard_session_sec)
-  )
-
-# first hour of rows crossing hours
-keyboard_h1 <- keyboard |>
-  filter(
-    hour(tm_session_start) != hour(tm_session_end)
-  ) |>
-  mutate(
-    amt_keyboard_session_sec = amt_keyboard_session_sec -
-      (tm_session_end - floor_date(tm_session_end, unit = "hour")),
-    tm_session_end = ceiling_date(tm_session_start, unit = "hour")
-  )
-
-# second hour of rows crossing hours
-keyboard_h2 <- keyboard |>
-  filter(
-    hour(tm_session_start) != hour(tm_session_end)
-  ) |>
-  mutate(
-    amt_keyboard_session_sec = tm_session_end -
-      floor_date(tm_session_end, unit = "hour"),
-    tm_session_start = floor_date(tm_session_end, unit = "hour"),
-    n_record_session = 0
-  )
-
-# combine
-keyboard_transf <- bind_rows(
-  keyboard_unchanged,
-  keyboard_h1,
-  keyboard_h2
+keyboard_split <- split_multi_hour_obs(
+  data       = keyboard,
+  time_start = tm_session_start,
+  time_end   = tm_session_end,
+  var_secs   = amt_keyboard_session_sec,
+  vars_oth   = "n_record_session"
 )
-
 
 # compute hourly keyboard use --------------------------------------------------
 
-keyboard_hourly <- keyboard_transf |>
+keyboard_hourly <- keyboard_split |>
   mutate(
     date = date(tm_session_start),
     hour = hour(tm_session_start)
@@ -195,48 +329,16 @@ screentime <- screentime_raw |>
 # separate these into different observations (two rows instead of one). Seconds
 # of screen time use are allocated appropriately to either of the two hours.
 
-# rows with observations that do not cross hours
-screentime_unchanged <- screentime |>
-  filter(
-    hour(tm_usagewindow_start) == hour(tm_usagewindow_end)
-  ) |>
-  mutate(
-    n_foreground_sec = lubridate::as.duration(n_foreground_sec)
-  )
-
-# first hour of rows crossing hours
-screentime_h1 <- screentime |>
-  filter(
-    hour(tm_usagewindow_start) != hour(tm_usagewindow_end)
-  ) |>
-  mutate(
-    n_foreground_sec = n_foreground_sec -
-      (tm_usagewindow_end - floor_date(tm_usagewindow_end, unit = "hour")),
-    tm_usagewindow_end = ceiling_date(tm_usagewindow_start, unit = "hour")
-  )
-
-# second hour of rows crossing hours
-screentime_h2 <- screentime |>
-  filter(
-    hour(tm_usagewindow_start) != hour(tm_usagewindow_end)
-  ) |>
-  mutate(
-    n_foreground_sec = tm_usagewindow_end -
-      floor_date(tm_usagewindow_end, unit = "hour"),
-    tm_usagewindow_start = floor_date(tm_usagewindow_end, unit = "hour")
-  )
-
-# combine
-screentime_transf <- bind_rows(
-  screentime_unchanged,
-  screentime_h1,
-  screentime_h2
+screentime_split <- split_multi_hour_obs(
+  data       = screentime,
+  time_start = tm_usagewindow_start,
+  time_end   = tm_usagewindow_end,
+  var_secs   = n_foreground_sec
 )
-
 
 # compute hourly screentime use ------------------------------------------------
 
-screentime_hourly <- screentime_transf |>
+screentime_hourly <- screentime_split |>
   mutate(
     date = date(tm_usagewindow_start),
     hour = hour(tm_usagewindow_start)
