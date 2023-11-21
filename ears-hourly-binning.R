@@ -30,7 +30,33 @@ screentime_raw <- purrr::map_dfr(
 #   ............................................................................
 #   keyboard: seconds of use / number of keystrokes                         ####
 
+# KSANA recommended to remove the following app IDs
+id_app_exclude <- c(
+  "com.android.systemui",
+  "com.lge.qmemoplus",
+  "com.google.android.gms",
+  "com.sec.android.app.launcher",
+  "com.sec.android.mimage.photoretouching",
+  "us.ozteam.bigfoot",
+  "com.pixel.art.coloring.color.number",
+  "com.robtopx.geometryjumplite",
+  "com.google.android.inputmethod.latin",
+  "com.lge.clock",
+  "com.pt.bark",
+  "com.tct.launcher",
+  "com.lge.launcher3",
+  "royaln.Removeunwantedcontent",
+  "com.samsung.android.contacts",
+  "com.google.android.packageinstaller",
+  "com.wssyncmldm"
+)
+
 keyboard <- keyboard_raw |>
+  # exclude app IDs
+  filter(
+    !id_app %in% id_app_exclude
+  ) |>
+  # remove extraneous variables
   select(
     -c(
       timezone,
@@ -147,15 +173,19 @@ screentime <- screentime_raw |>
   filter(
     n_foreground_sec <= 20*60*60
   ) |>
+  # exclude app IDs
+  filter(
+    !id_app %in% id_app_exclude
+  ) |>
   # remove extraneous variables
   select(
     -c(
+      timezone,
       epoch_usagewindow_start,
       epoch_usagewindow_end,
       n_foreground_ms
     )
   )
-
 
 # split multi-hour observations -----------------------------------------------
 
